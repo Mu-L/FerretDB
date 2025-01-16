@@ -17,9 +17,10 @@ package conninfo
 
 import (
 	"context"
+	"net/netip"
 	"sync"
 
-	"github.com/FerretDB/FerretDB/internal/util/resource"
+	"github.com/xdg-go/scram"
 )
 
 // contextKey is a named unexported type for the safe use of context.WithValue.
@@ -28,52 +29,96 @@ type contextKey struct{}
 // Context key for WithConnInfo/Get.
 var connInfoKey = contextKey{}
 
-// ConnInfo represents connection info.
+// ConnInfo represents client connection information.
 type ConnInfo struct {
-	PeerAddr string
+	// the order of fields is weird to make the struct smaller due to alignment
 
-	token *resource.Token
+	sc *scram.ServerConversation // protected by rw
+	db string                    // protected by rw
 
-	rw       sync.RWMutex
-	username string
-	password string
+	Peer netip.AddrPort // invalid for Unix domain sockets
+
+	username string // protected by rw
+	password string // protected by rw
+
+	rw sync.RWMutex
+
+	metadataRecv bool // protected by rw
+
+	// If true, backend implementations should not perform authentication
+	// by adding username and password to the connection string.
+	// It is set to true for background connections (such us capped collections cleanup)
+	// and by the new authentication.
+	// See where it is used for more details.
+	bypassBackendAuth bool // protected by rw
 }
 
-// NewConnInfo return a new ConnInfo.
-func NewConnInfo() *ConnInfo {
-	connInfo := &ConnInfo{
-		token: resource.NewToken(),
-	}
-
-	resource.Track(connInfo, connInfo.token)
-
-	return connInfo
+// New returns a new ConnInfo.
+func New() *ConnInfo {
+	return new(ConnInfo)
 }
 
-// Close frees resources.
-func (connInfo *ConnInfo) Close() {
-	resource.Untrack(connInfo, connInfo.token)
-}
-
-// Auth returns stored username and password.
-func (connInfo *ConnInfo) Auth() (username, password string) {
+// Username returns stored username.
+func (connInfo *ConnInfo) Username() string {
 	connInfo.rw.RLock()
 	defer connInfo.rw.RUnlock()
 
-	return connInfo.username, connInfo.password
+	return connInfo.username
 }
 
-// SetAuth stores username and password.
-func (connInfo *ConnInfo) SetAuth(username, password string) {
+// Auth returns stored username, password (for PLAIN mechanism), SCRAM server conversation (if any) and user's authentication db.
+func (connInfo *ConnInfo) Auth() (username, password string, sc *scram.ServerConversation, db string) {
+	connInfo.rw.RLock()
+	defer connInfo.rw.RUnlock()
+
+	return connInfo.username, connInfo.password, connInfo.sc, connInfo.db
+}
+
+// SetAuth stores username, password (for PLAIN mechanism), SCRAM server conversation (if any) and user's authentication db.
+func (connInfo *ConnInfo) SetAuth(username, password string, sc *scram.ServerConversation, db string) {
 	connInfo.rw.Lock()
 	defer connInfo.rw.Unlock()
 
 	connInfo.username = username
 	connInfo.password = password
+	connInfo.sc = sc
+	connInfo.db = db
 }
 
-// WithConnInfo returns a new context with the given ConnInfo.
-func WithConnInfo(ctx context.Context, connInfo *ConnInfo) context.Context {
+// MetadataRecv returns whatever client metadata was received already.
+func (connInfo *ConnInfo) MetadataRecv() bool {
+	connInfo.rw.RLock()
+	defer connInfo.rw.RUnlock()
+
+	return connInfo.metadataRecv
+}
+
+// SetMetadataRecv marks client metadata as received.
+func (connInfo *ConnInfo) SetMetadataRecv() {
+	connInfo.rw.Lock()
+	defer connInfo.rw.Unlock()
+
+	connInfo.metadataRecv = true
+}
+
+// SetBypassBackendAuth marks the connection as not requiring backend authentication.
+func (connInfo *ConnInfo) SetBypassBackendAuth() {
+	connInfo.rw.Lock()
+	defer connInfo.rw.Unlock()
+
+	connInfo.bypassBackendAuth = true
+}
+
+// BypassBackendAuth returns whether the connection requires backend authentication.
+func (connInfo *ConnInfo) BypassBackendAuth() bool {
+	connInfo.rw.RLock()
+	defer connInfo.rw.RUnlock()
+
+	return connInfo.bypassBackendAuth
+}
+
+// Ctx returns a derived context with the given ConnInfo.
+func Ctx(ctx context.Context, connInfo *ConnInfo) context.Context {
 	return context.WithValue(ctx, connInfoKey, connInfo)
 }
 

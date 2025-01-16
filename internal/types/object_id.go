@@ -16,6 +16,7 @@ package types
 
 import (
 	"encoding/binary"
+	"log/slog"
 	"math/rand"
 	"sync/atomic"
 	"time"
@@ -34,7 +35,7 @@ const ObjectIDLen = 12
 
 // NewObjectID returns a new ObjectID.
 func NewObjectID() ObjectID {
-	return newObjectIDTime(time.Now())
+	return newObjectIDTime(time.Now()) // https://github.com/FerretDB/FerretDB/issues/3486
 }
 
 // newObjectIDTime returns a new ObjectID with given time.
@@ -68,3 +69,13 @@ func init() {
 	must.NotFail(rand.Read(objectIDProcess[:]))
 	objectIDCounter.Store(rand.Uint32())
 }
+
+// LogValue implements [slog.LogValuer].
+func (o ObjectID) LogValue() slog.Value {
+	return slogValue(o, 1)
+}
+
+// check interfaces
+var (
+	_ slog.LogValuer = ObjectID{}
+)

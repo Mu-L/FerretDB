@@ -22,26 +22,26 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"log/slog"
 	"net"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/alecthomas/kong"
-	"github.com/jackc/pgx/v4"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/tigrisdata/tigris-client-go/config"
-	"go.uber.org/zap"
 
 	"github.com/FerretDB/FerretDB/build/version"
-	"github.com/FerretDB/FerretDB/internal/handlers/pg/pgdb"
-	"github.com/FerretDB/FerretDB/internal/handlers/tigris/tigrisdb"
+	mysqlpool "github.com/FerretDB/FerretDB/internal/backends/mysql/metadata/pool"
+	"github.com/FerretDB/FerretDB/internal/backends/postgresql/metadata/pool"
 	"github.com/FerretDB/FerretDB/internal/util/ctxutil"
 	"github.com/FerretDB/FerretDB/internal/util/debug"
+	"github.com/FerretDB/FerretDB/internal/util/lazyerrors"
 	"github.com/FerretDB/FerretDB/internal/util/logging"
 	"github.com/FerretDB/FerretDB/internal/util/state"
 )
@@ -54,11 +54,15 @@ var (
 	errorTemplate = template.Must(template.New("error").Option("missingkey=error").Parse(string(errorTemplateB)))
 )
 
-// waitForPort waits for the given port to be available until ctx is done.
-func waitForPort(ctx context.Context, logger *zap.SugaredLogger, port uint16) error {
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	logger.Infof("Waiting for %s to be up...", addr)
+// versionFile contains version information with leading v.
+const versionFile = "build/version/version.txt"
 
+// waitForPort waits for the given port to be available until ctx is canceled.
+func waitForPort(ctx context.Context, logger *slog.Logger, port uint16) error {
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	logger.InfoContext(ctx, fmt.Sprintf("Waiting for %s to be up", addr))
+
+	var retry int64
 	for ctx.Err() == nil {
 		conn, err := net.Dial("tcp", addr)
 		if err == nil {
@@ -66,15 +70,17 @@ func waitForPort(ctx context.Context, logger *zap.SugaredLogger, port uint16) er
 			return nil
 		}
 
-		logger.Infof("%s: %s", addr, err)
-		ctxutil.Sleep(ctx, time.Second)
+		logger.InfoContext(ctx, fmt.Sprintf("%s: %s", addr, err))
+
+		retry++
+		ctxutil.SleepWithJitter(ctx, time.Second, retry)
 	}
 
 	return fmt.Errorf("failed to connect to %s", addr)
 }
 
 // setupAnyPostgres configures given PostgreSQL.
-func setupAnyPostgres(ctx context.Context, logger *zap.SugaredLogger, uri string) error {
+func setupAnyPostgres(ctx context.Context, logger *slog.Logger, uri string) error {
 	u, err := url.Parse(uri)
 	if err != nil {
 		return err
@@ -85,171 +91,217 @@ func setupAnyPostgres(ctx context.Context, logger *zap.SugaredLogger, uri string
 		return err
 	}
 
+	if u.User == nil {
+		return lazyerrors.New("No username specified")
+	}
+
 	if err = waitForPort(ctx, logger, uint16(port)); err != nil {
 		return err
 	}
 
-	p, err := state.NewProvider("")
+	sp, err := state.NewProvider("")
 	if err != nil {
 		return err
 	}
 
-	var pgPool *pgdb.Pool
+	p, err := pool.New(uri, logger, sp)
+	if err != nil {
+		return err
+	}
 
+	defer p.Close()
+
+	username := u.User.Username()
+	password, _ := u.User.Password()
+
+	var retry int64
 	for ctx.Err() == nil {
-		if pgPool, err = pgdb.NewPool(ctx, uri, logger.Desugar(), p); err == nil {
+		if _, err = p.Get(username, password); err == nil {
 			break
 		}
 
-		logger.Infof("%s: %s", uri, err)
-		ctxutil.Sleep(ctx, time.Second)
+		logger.InfoContext(ctx, fmt.Sprintf("%s: %s", uri, err))
+
+		retry++
+		ctxutil.SleepWithJitter(ctx, time.Second, retry)
 	}
 
-	defer pgPool.Close()
-
-	logger.Info("Creating databases...")
-
-	for _, name := range []string{"admin", "test"} {
-		err = pgPool.InTransaction(ctx, func(tx pgx.Tx) error {
-			return pgdb.CreateDatabaseIfNotExists(ctx, tx, name)
-		})
-		if err != nil && !errors.Is(err, pgdb.ErrAlreadyExist) {
-			return err
-		}
-	}
-
-	logger.Info("Tweaking settings...")
-
-	for _, q := range []string{
-		`CREATE ROLE readonly NOINHERIT LOGIN PASSWORD 'readonly_password'`,
-
-		// TODO Grant permissions to readonly role.
-		// https://github.com/FerretDB/FerretDB/issues/1025
-
-		`ANALYZE`, // to make tests more stable
-	} {
-		if _, err = pgPool.Exec(ctx, q); err != nil {
-			return err
-		}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	return nil
 }
 
 // setupPostgres configures `postgres` container.
-func setupPostgres(ctx context.Context, logger *zap.SugaredLogger) error {
+func setupPostgres(ctx context.Context, logger *slog.Logger) error {
 	// user `username` must exist, but password may be any, even empty
-	return setupAnyPostgres(ctx, logger.Named("postgres"), "postgres://username@127.0.0.1:5432/ferretdb")
+	return setupAnyPostgres(ctx, logging.WithName(logger, "postgres"), "postgres://username@127.0.0.1:5432/ferretdb")
 }
 
 // setupPostgresSecured configures `postgres_secured` container.
-func setupPostgresSecured(ctx context.Context, logger *zap.SugaredLogger) error {
-	return setupAnyPostgres(ctx, logger.Named("postgres_secured"), "postgres://username:password@127.0.0.1:5433/ferretdb")
+func setupPostgresSecured(ctx context.Context, logger *slog.Logger) error {
+	return setupAnyPostgres(ctx, logging.WithName(logger, "postgres_secured"), "postgres://username:password@127.0.0.1:5433/ferretdb") //nolint:lll // for readability
 }
 
-// setupAnyTigris configures given Tigris.
-func setupAnyTigris(ctx context.Context, logger *zap.SugaredLogger, port uint16) error {
-	err := waitForPort(ctx, logger, port)
+// setupMySQL configures `mysql` container.
+func setupMySQL(ctx context.Context, logger *slog.Logger) error {
+	uri := "mysql://root:password@127.0.0.1:3306/ferretdb"
+
+	sp, err := state.NewProvider("")
 	if err != nil {
 		return err
 	}
 
-	cfg := &config.Driver{
-		URL: fmt.Sprintf("127.0.0.1:%d", port),
+	if err = waitForPort(ctx, logging.WithName(logger, "mysql"), 3306); err != nil {
+		return err
 	}
 
-	var db *tigrisdb.TigrisDB
+	p, err := mysqlpool.New(uri, logger, sp)
+	if err != nil {
+		return err
+	}
 
+	defer p.Close()
+
+	var retry int64
 	for ctx.Err() == nil {
-		if db, err = tigrisdb.New(ctx, cfg, logger.Desugar()); err == nil {
+		db, err := p.Get("root", "password")
+		if err == nil {
+			if _, err = db.ExecContext(ctx, "GRANT ALL PRIVILEGES ON *.* TO 'username'@'%';"); err != nil {
+				return lazyerrors.Error(err)
+			}
+
 			break
 		}
 
-		logger.Infof("%s: %s", cfg.URL, err)
-		ctxutil.Sleep(ctx, time.Second)
+		logger.InfoContext(ctx, fmt.Sprintf("%s: %s", uri, err))
+
+		retry++
+		ctxutil.SleepWithJitter(ctx, time.Second, retry)
 	}
 
-	defer db.Driver.Close()
-
-	logger.Info("Creating databases...")
-
-	for _, name := range []string{"admin", "test"} {
-		if _, err = db.Driver.CreateProject(ctx, name); err != nil {
-			return err
-		}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	return nil
 }
 
-// setupTigris configures all Tigris containers.
-func setupTigris(ctx context.Context, logger *zap.SugaredLogger) error {
-	logger = logger.Named("tigris")
-
-	// See docker-compose.yml.
-	for _, port := range []uint16{8081, 8091, 8092, 8093, 8094} {
-		if err := setupAnyTigris(ctx, logger.Named(strconv.Itoa(int(port))), port); err != nil {
-			return err
-		}
+// setupMongodb configures `mongodb` container.
+func setupMongodb(ctx context.Context, logger *slog.Logger) error {
+	if err := waitForPort(ctx, logging.WithName(logger, "mongodb"), 47017); err != nil {
+		return err
 	}
 
-	return nil
+	eval := `'rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:47017" }]})'`
+	args := []string{"compose", "exec", "-T", "mongodb", "mongosh", "--port=47017", "--eval", eval}
+
+	var buf bytes.Buffer
+	var retry int64
+
+	for ctx.Err() == nil {
+		buf.Reset()
+
+		err := runCommand("docker", args, &buf, logger)
+		if err == nil {
+			break
+		}
+
+		logger.InfoContext(ctx, fmt.Sprintf("%s:\n%s", err, buf.String()))
+
+		retry++
+		ctxutil.SleepWithJitter(ctx, time.Second, retry)
+	}
+
+	return ctx.Err()
+}
+
+// setupMongodbSecured configures `mongodb_secured` container.
+func setupMongodbSecured(ctx context.Context, logger *slog.Logger) error {
+	if err := waitForPort(ctx, logging.WithName(logger, "mongodb_secured"), 47018); err != nil {
+		return err
+	}
+
+	eval := `'rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:47018" }]})'`
+	shell := `mongodb://username:password@127.0.0.1:47018/?tls=true&tlsCertificateKeyFile=/etc/certs/client.pem&tlsCaFile=/etc/certs/rootCA-cert.pem` //nolint:lll // for readability
+	args := []string{"compose", "exec", "-T", "mongodb_secured", "mongosh", "--eval", eval, "--shell", shell}
+
+	var buf bytes.Buffer
+	var retry int64
+
+	for ctx.Err() == nil {
+		buf.Reset()
+
+		err := runCommand("docker", args, &buf, logger)
+		if err == nil {
+			break
+		}
+
+		logger.InfoContext(ctx, fmt.Sprintf("%s:\n%s", err, buf.String()))
+
+		retry++
+		ctxutil.SleepWithJitter(ctx, time.Second, retry)
+	}
+
+	return ctx.Err()
 }
 
 // setup runs all setup commands.
-func setup(ctx context.Context, logger *zap.SugaredLogger) error {
-	go debug.RunHandler(ctx, "127.0.0.1:8089", prometheus.DefaultRegisterer, logger.Named("debug").Desugar())
-
-	if err := setupPostgres(ctx, logger); err != nil {
-		return err
+func setup(ctx context.Context, logger *slog.Logger) error {
+	h, err := debug.Listen(&debug.ListenOpts{
+		TCPAddr: "127.0.0.1:8089",
+		L:       logging.WithName(logger, "debug"),
+		R:       prometheus.DefaultRegisterer,
+	})
+	if err != nil {
+		return lazyerrors.Error(err)
 	}
 
-	if err := setupPostgresSecured(ctx, logger); err != nil {
-		return err
+	go h.Serve(ctx)
+
+	for _, f := range []func(context.Context, *slog.Logger) error{
+		setupPostgres,
+		setupPostgresSecured,
+		setupMySQL,
+		setupMongodb,
+		setupMongodbSecured,
+	} {
+		if err := f(ctx, logger); err != nil {
+			return err
+		}
 	}
 
-	if err := setupTigris(ctx, logger); err != nil {
-		return err
-	}
-
-	if err := waitForPort(ctx, logger.Named("mongodb"), 47017); err != nil {
-		return err
-	}
-
-	if err := waitForPort(ctx, logger.Named("mongodb_secure"), 47018); err != nil {
-		return err
-	}
-
-	logger.Info("Done.")
+	logger.InfoContext(ctx, "Done")
 	return nil
 }
 
 // runCommand runs command with given arguments.
-func runCommand(command string, args []string, stdout io.Writer, logger *zap.SugaredLogger) error {
+func runCommand(command string, args []string, stdout io.Writer, logger *slog.Logger) error {
 	bin, err := exec.LookPath(command)
 	if err != nil {
 		return err
 	}
 	cmd := exec.Command(bin, args...)
-	logger.Debugf("Running %s", strings.Join(cmd.Args, " "))
+	logger.Debug(fmt.Sprintf("Running %s", strings.Join(cmd.Args, " ")))
 
 	cmd.Stdout = stdout
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s failed: %s", strings.Join(args, " "), err)
+		return fmt.Errorf("%s failed: %s", strings.Join(cmd.Args, " "), err)
 	}
 
 	return nil
 }
 
 // printDiagnosticData prints diagnostic data and error template on stdout.
-func printDiagnosticData(setupError error, logger *zap.SugaredLogger) {
-	runCommand("docker", []string{"compose", "logs"}, os.Stdout, logger)
+func printDiagnosticData(w io.Writer, setupError error, logger *slog.Logger) error {
+	_ = runCommand("docker", []string{"compose", "logs"}, w, logger)
 
-	runCommand("docker", []string{"compose", "ps", "--all"}, os.Stdout, logger)
+	_ = runCommand("docker", []string{"compose", "ps", "--all"}, w, logger)
 
-	runCommand("docker", []string{"stats", "--all", "--no-stream"}, os.Stdout, logger)
+	_ = runCommand("docker", []string{"stats", "--all", "--no-stream"}, w, logger)
 
 	var buf bytes.Buffer
 
@@ -280,7 +332,7 @@ func printDiagnosticData(setupError error, logger *zap.SugaredLogger) {
 
 	info := version.Get()
 
-	errorTemplate.Execute(os.Stdout, map[string]any{
+	return errorTemplate.Execute(w, map[string]any{
 		"Error": setupError,
 
 		"GOOS":   runtime.GOOS,
@@ -302,33 +354,218 @@ func printDiagnosticData(setupError error, logger *zap.SugaredLogger) {
 	})
 }
 
+// shellMkDir creates all directories from given paths.
+func shellMkDir(paths ...string) error {
+	var errs error
+
+	for _, path := range paths {
+		if err := os.MkdirAll(path, 0o777); err != nil {
+			errs = errors.Join(errs, err)
+		}
+	}
+
+	return errs
+}
+
+// shellRmDir removes all directories from given paths.
+func shellRmDir(paths ...string) error {
+	var errs error
+
+	for _, path := range paths {
+		if err := os.RemoveAll(path); err != nil {
+			errs = errors.Join(errs, err)
+		}
+	}
+
+	return errs
+}
+
+// shellRead will show the content of a file.
+func shellRead(w io.Writer, paths ...string) error {
+	for _, path := range paths {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+
+		fmt.Fprint(w, string(b))
+	}
+
+	return nil
+}
+
+// packageVersion will print out FerretDB's package version (omitting leading v).
+func packageVersion(w io.Writer, file string) error {
+	b, err := os.ReadFile(file)
+	if err != nil {
+		return err
+	}
+
+	v := string(b)
+	v = strings.TrimPrefix(v, "v")
+
+	_, err = fmt.Fprint(w, v)
+
+	return err
+}
+
+// TestsRunParams represents `envtool tests run` parameters.
+//
+//nolint:vet // for readability
+type TestsRunParams struct {
+	ShardIndex uint   `help:"Shard index, starting from 1."`
+	ShardTotal uint   `help:"Total number of shards."`
+	Run        string `help:"Run only tests matching the regexp."`
+	Skip       string `help:"Skip tests matching the regexp."`
+
+	Args []string `arg:"" help:"Other arguments and flags for 'go test'." passthrough:""`
+}
+
 // cli struct represents all command-line commands, fields and flags.
 // It's used for parsing the user input.
+//
+//nolint:vet // for readability
 var cli struct {
 	Debug bool `help:"Enable debug mode."`
+
+	Setup struct{} `cmd:"" help:"Setup development environment."`
+
+	PackageVersion struct{} `cmd:"" help:"Print package version."`
+
+	Shell struct {
+		Mkdir struct {
+			Paths []string `arg:"" name:"path" help:"Paths to create." type:"path"`
+		} `cmd:"" help:"Create directories if they do not already exist."`
+		Rmdir struct {
+			Paths []string `arg:"" name:"path" help:"Paths to remove." type:"path"`
+		} `cmd:"" help:"Remove directories."`
+		Read struct {
+			Paths []string `arg:"" name:"path" help:"Paths to read." type:"path"`
+		} `cmd:"" help:"Read files."`
+	} `cmd:""`
+
+	Tests struct {
+		Run TestsRunParams `cmd:"" help:"Run tests."`
+	} `cmd:""`
+
+	Fuzz struct {
+		Corpus struct {
+			Src string `arg:"" help:"Source, one of: 'seed', 'generated', or collected corpus' directory."`
+			Dst string `arg:"" help:"Destination, one of: 'seed', 'generated', or collected corpus' directory."`
+		} `cmd:"" help:"Sync fuzz corpora."`
+	} `cmd:""`
 }
 
 func main() {
-	kong.Parse(&cli)
+	kongCtx := kong.Parse(&cli)
 
-	// always enable debug logging on CI
+	// https://docs.github.com/en/actions/learn-github-actions/variables#default-environment-variables
 	if t, _ := strconv.ParseBool(os.Getenv("CI")); t {
 		cli.Debug = true
 	}
 
-	level := zap.InfoLevel
+	level := slog.LevelInfo
 	if cli.Debug {
-		level = zap.DebugLevel
+		level = slog.LevelDebug
 	}
 
-	logging.Setup(level, "")
-	logger := zap.S()
+	opts := &logging.NewHandlerOpts{
+		Base:         "console",
+		Level:        level,
+		RemoveTime:   true,
+		RemoveSource: true,
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
+	logging.Setup(opts, "")
+	logger := slog.Default()
 
-	if err := setup(ctx, logger); err != nil {
-		printDiagnosticData(err, logger)
-		os.Exit(1)
+	cmd := kongCtx.Command()
+	logger.Debug(fmt.Sprintf("Command: %q", cmd))
+
+	var err error
+
+	switch cmd {
+	case "setup":
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+
+		err = setup(ctx, logger)
+
+	case "package-version":
+		err = packageVersion(os.Stdout, versionFile)
+
+	case "shell mkdir <path>":
+		err = shellMkDir(cli.Shell.Mkdir.Paths...)
+	case "shell rmdir <path>":
+		err = shellRmDir(cli.Shell.Rmdir.Paths...)
+	case "shell read <path>":
+		err = shellRead(os.Stdout, cli.Shell.Read.Paths...)
+
+	case "tests run <args>":
+		ctx, stop := ctxutil.SigTerm(context.Background())
+		defer stop()
+
+		err = testsRun(ctx, &cli.Tests.Run, logger)
+
+	case "fuzz corpus <src> <dst>":
+		var seedCorpus, generatedCorpus string
+
+		if seedCorpus, err = os.Getwd(); err != nil {
+			logger.LogAttrs(context.Background(), logging.LevelFatal, "Failed to get current directory", logging.Error(err))
+		}
+
+		if generatedCorpus, err = fuzzGeneratedCorpus(); err != nil {
+			logger.LogAttrs(context.Background(), logging.LevelFatal, "Failed to generate fuzz corpus", logging.Error(err))
+		}
+
+		var src, dst string
+
+		switch cli.Fuzz.Corpus.Src {
+		case "seed":
+			src = seedCorpus
+		case "generated":
+			src = generatedCorpus
+		default:
+			if src, err = filepath.Abs(cli.Fuzz.Corpus.Src); err != nil {
+				logger.LogAttrs(context.Background(), logging.LevelFatal, "Unknown fuzz corpus source", logging.Error(err))
+			}
+		}
+
+		switch cli.Fuzz.Corpus.Dst {
+		case "seed":
+			// Because we would need to add `/testdata/fuzz` back, and that's not very easy.
+			logger.LogAttrs(
+				context.Background(),
+				logging.LevelFatal,
+				"Copying to seed corpus is not supported",
+				logging.Error(err),
+			)
+		case "generated":
+			dst = generatedCorpus
+		default:
+			dst, err = filepath.Abs(cli.Fuzz.Corpus.Dst)
+			if err != nil {
+				logger.LogAttrs(context.Background(), logging.LevelFatal, "Unknown fuzz corpus destination", logging.Error(err))
+			}
+		}
+
+		err = fuzzCopyCorpus(src, dst, logger)
+
+	default:
+		err = fmt.Errorf("unknown command: %s", cmd)
+	}
+
+	if err != nil {
+		if cmd == "setup" {
+			_ = printDiagnosticData(os.Stderr, err, logger)
+		}
+
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			logger.Error("Failed to exit", logging.Error(exitErr))
+			os.Exit(exitErr.ExitCode())
+		}
+
+		logger.LogAttrs(context.Background(), logging.LevelFatal, "Failed unexpectedly", logging.Error(err))
 	}
 }

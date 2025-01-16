@@ -16,6 +16,7 @@ package types
 
 import (
 	"fmt"
+	"log/slog"
 	"regexp"
 	"regexp/syntax"
 
@@ -71,7 +72,7 @@ func (r Regex) Compile() (*regexp.Regexp, error) {
 		case 'i', 'm', 's':
 			opts += string(o)
 		case 'x':
-			// TODO: https://github.com/FerretDB/FerretDB/issues/592
+			// TODO https://github.com/FerretDB/FerretDB/issues/592
 			return nil, ErrOptionNotImplemented
 		default:
 			continue
@@ -120,3 +121,13 @@ func (r Regex) Compile() (*regexp.Regexp, error) {
 
 	return nil, lazyerrors.Error(err)
 }
+
+// LogValue implements [slog.LogValuer].
+func (r Regex) LogValue() slog.Value {
+	return slogValue(r, 1)
+}
+
+// check interfaces
+var (
+	_ slog.LogValuer = Regex{}
+)

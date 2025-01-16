@@ -24,7 +24,7 @@ import (
 	"github.com/FerretDB/FerretDB/internal/util/must"
 )
 
-// ConnMetrics represents conn metrics.
+// ConnMetrics represents metrics of an individual conn or a collection of conns.
 type ConnMetrics struct {
 	Requests  *prometheus.CounterVec
 	Responses *prometheus.CounterVec
@@ -60,13 +60,13 @@ func newConnMetrics() *ConnMetrics {
 	}
 }
 
-// Describe implements prometheus.Collector.
+// Describe implements [prometheus.Collector].
 func (cm *ConnMetrics) Describe(ch chan<- *prometheus.Desc) {
 	cm.Requests.Describe(ch)
 	cm.Responses.Describe(ch)
 }
 
-// Collect implements prometheus.Collector.
+// Collect implements [prometheus.Collector].
 func (cm *ConnMetrics) Collect(ch chan<- prometheus.Metric) {
 	cm.Requests.Collect(ch)
 	cm.Responses.Collect(ch)

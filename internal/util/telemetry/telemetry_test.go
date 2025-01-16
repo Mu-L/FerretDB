@@ -20,7 +20,6 @@ import (
 	"github.com/AlekSi/pointer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
 
 	"github.com/FerretDB/FerretDB/internal/util/testutil"
 )
@@ -72,9 +71,7 @@ func TestState(t *testing.T) {
 			err := f.UnmarshalText([]byte(tc.flag))
 			require.NoError(t, err)
 
-			logger := testutil.Logger(t, zap.NewAtomicLevelAt(zap.DebugLevel))
-
-			state, locked, err := initialState(&f, tc.dnt, tc.execName, tc.prev, logger)
+			state, locked, err := initialState(&f, tc.dnt, tc.execName, tc.prev, testutil.Logger(t))
 			if tc.err != "" {
 				assert.EqualError(t, err, tc.err)
 				return
